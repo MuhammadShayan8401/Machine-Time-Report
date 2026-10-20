@@ -39,12 +39,9 @@ streamlit run app.py
 
 Then open the address shown in the terminal (usually http://localhost:8501).
 
-## Deploy on Streamlit Community Cloud
+## Deployed on Streamlit Community Cloud
 
-1. Push this repo to GitHub.
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-3. Choose the repo, set the main file to `app.py`, and click **Deploy**.
-4. If the reports are sensitive, set the app to private in its settings.
+https://machinereport.streamlit.app/
 
 ## Use without the web page
 
