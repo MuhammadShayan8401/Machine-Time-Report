@@ -1,200 +1,504 @@
+
 #!/usr/bin/env python3
 """Build the hourly machine time workbook from Daily Production Report PDFs.
 
 Usage:
-  python make_report.py PDF_FOLDER [-o out.xlsx] [--threshold 10] [--expect "B650 T" "B1000 T"]
-Needs: pip install pdfplumber openpyxl
+    python make_report.py PDF_FOLDER [-o out.xlsx]
+        [--threshold 10] [--expect "B650 T" "B1000 T"]
+
+Dependencies:
+    pip install pdfplumber openpyxl
 """
-import argparse, glob, os, re, sys
+
+import argparse
+import glob
+import os
+import re
+import sys
 from datetime import timedelta
+
 import pdfplumber
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import FormulaRule
 
+
 ROW_RE = re.compile(r"^\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}$")
+_SPAN_RE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
+
 
 def dur(s):
+    """Convert a duration string containing hours, minutes and seconds to seconds."""
     s = (s or "").strip()
-    g = lambda u: int(m.group(1)) if (m := re.search(r"(\d+)\s*" + u, s)) else 0
-    return g("h") * 3600 + g("m") * 60 + g("s")
 
-def norm_name(n):
-    return re.sub(r"\s+", " ", re.sub(r"\(", " (", n)).strip()
+    def get(unit):
+        match = re.search(r"(\d+)\s*" + unit, s)
+        return int(match.group(1)) if match else 0
+
+    return get("h") * 3600 + get("m") * 60 + get("s")
+
+
+def norm_name(name):
+    """Normalize whitespace in a machine name."""
+    return re.sub(r"\s+", " ", re.sub(r"\(", " (", name or "")).strip()
+
 
 def parse_pdf(path):
-    machine = date = None
+    """Extract the machine name, report date and hourly rows from a PDF."""
+    machine = None
+    date = None
     rows = []
+
     with pdfplumber.open(path) as pdf:
-        for pg in pdf.pages:
-            txt = pg.extract_text() or ""
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+
             if machine is None:
-                m = re.search(r"Daily Production Report\s+(.+?)\s*\|", txt)
-                if m: machine = norm_name(m.group(1))
-                d = re.search(r"(\d{1,2} [A-Za-z]{3} \d{4})", txt)
-                if d: date = d.group(1)
-            for tb in pg.extract_tables():
-                for r in tb:
-                    if r and r[0] and ROW_RE.match(r[0].strip()) and len(r) >= 9:
-                        rows.append(dict(time=r[0].strip(), status=r[1], shots=r[2],
-                                         on=dur(r[6]), idle=dur(r[7]), off=dur(r[8])))
+                match = re.search(
+                    r"Daily Production Report\s+(.+?)\s*\|", text
+                )
+                if match:
+                    machine = norm_name(match.group(1))
+
+            if date is None:
+                match = re.search(r"(\d{1,2} [A-Za-z]{3} \d{4})", text)
+                if match:
+                    date = match.group(1)
+
+            for table in page.extract_tables():
+                for row in table:
+                    if (
+                        row
+                        and row[0]
+                        and ROW_RE.match(row[0].strip())
+                        and len(row) >= 9
+                    ):
+                        rows.append(
+                            {
+                                "time": row[0].strip(),
+                                "status": row[1],
+                                "shots": row[2],
+                                "on": dur(row[6]),
+                                "idle": dur(row[7]),
+                                "off": dur(row[8]),
+                            }
+                        )
+
     return machine, date, rows
 
+
+def _aggregate_hours(machine_rows):
+    """Aggregate source rows by their starting clock hour."""
+    slots = [(9 + i) % 24 for i in range(24)]
+    aggregate = {hour: [0, 0, 0] for hour in slots}
+
+    for row in machine_rows:
+        hour = int(row["time"].split(":")[0]) % 24
+        aggregate[hour][0] += row["on"]
+        aggregate[hour][1] += row["idle"]
+        aggregate[hour][2] += row["off"]
+
+    for hour in slots:
+        if sum(aggregate[hour]) == 0:
+            aggregate[hour][2] = 3600
+
+    return slots, aggregate
+
+
+def hourly_table(data, order=None):
+    """Return hourly report rows with durations expressed in seconds."""
+    output = []
+
+    for machine in (order if order is not None else sorted(data)):
+        if machine not in data:
+            continue
+
+        slots, aggregate = _aggregate_hours(data[machine])
+
+        for hour in slots:
+            on, idle, off = aggregate[hour]
+            missing = max(0, 3600 - (on + idle + off))
+
+            output.append(
+                {
+                    "hour": (
+                        f"{hour:02d}:00 - {(hour + 1) % 24:02d}:00"
+                    ),
+                    "shift": "A" if 9 <= hour < 21 else "B",
+                    "machine": machine,
+                    "on": on,
+                    "idle": idle,
+                    "off": off,
+                    "missing": missing,
+                }
+            )
+
+    return output
+
+
 def build_workbook(data, date, out, threshold=10, expect=()):
+    """Build an Excel workbook containing Hourly and Summary worksheets."""
     order = sorted(set(data) | set(expect))
     slots = [(9 + i) % 24 for i in range(24)]
 
-    F = "Arial"
-    hf = Font(name=F, bold=True, color="FFFFFF"); hfill = PatternFill("solid", fgColor="1F3864")
-    body = Font(name=F); blue = Font(name=F, color="0000FF")
-    thin = Side(style="thin", color="BFBFBF"); bd = Border(left=thin, right=thin, top=thin, bottom=thin)
-    DUR = "[h]:mm:ss"
+    font_name = "Arial"
+    header_font = Font(name=font_name, bold=True, color="FFFFFF")
+    header_fill = PatternFill(fill_type="solid", fgColor="1F3864")
+    body_font = Font(name=font_name)
+    blue_font = Font(name=font_name, color="0000FF")
 
-    wb = Workbook(); ws = wb.active; ws.title = "Hourly"
-    ws["A1"] = f"Hourly Machine Time Report - {date} 09:00 to next day 09:00"; ws["A1"].font = Font(name=F, bold=True, size=13)
-    ws["A2"] = "Threshold:"; ws["A2"].font = Font(name=F, bold=True)
-    ws["B2"] = f"=TIME(0,{threshold},0)"; ws["B2"].number_format = DUR; ws["B2"].font = Font(name=F, bold=True, color="0000FF")
-    heads = ["Time Duration", "Shift", "Machine Name", "On Time", "Idle Time", "Off Time", "Missing Time", f"Above {threshold} Min Threshold"]
-    for c, h in enumerate(heads, 1):
-        x = ws.cell(3, c, h); x.font = hf; x.fill = hfill; x.border = bd; x.alignment = Alignment(horizontal="center")
-    r = 4
-    for m in order:
-        if m not in data: continue
-        agg = {s: [0, 0, 0] for s in slots}
-        for row in data[m]:
-            h = int(row["time"].split(":")[0])
-            agg[h][0] += row["on"]; agg[h][1] += row["idle"]; agg[h][2] += row["off"]
-        for s in slots:
-            if sum(agg[s]) == 0: agg[s][2] = 3600   # no activity at all in this hour = machine off
-            ws.cell(r, 1, f"{s:02d}:00 - {(s + 1) % 24:02d}:00")
-            ws.cell(r, 2, "A (09:00-21:00)" if 9 <= s < 21 else "B (21:00-09:00)")
-            ws.cell(r, 3, m)
-            for c, v in zip((4, 5, 6), agg[s]):
-                ws.cell(r, c, timedelta(seconds=v)).font = blue
-            ws.cell(r, 7, f"=MAX(0,TIME(1,0,0)-(D{r}+E{r}+F{r}))")
-            ws.cell(r, 8, f'=IF(G{r}>$B$2,"Above threshold","Within threshold")').alignment = Alignment(horizontal="center")
-            for c in range(1, 9):
-                ws.cell(r, c).border = bd
-                if c not in (4, 5, 6): ws.cell(r, c).font = body
-            for c in (4, 5, 6, 7): ws.cell(r, c).number_format = DUR
-            r += 1
-    last = r - 1
-    for c, w in zip("ABCDEFGH", [16, 16, 16, 12, 12, 12, 14, 22]): ws.column_dimensions[c].width = w
-    ws.freeze_panes = "A4"; ws.auto_filter.ref = f"A3:H{last}"
-    red = PatternFill("solid", bgColor="FFC7CE", fgColor="FFC7CE"); grn = PatternFill("solid", bgColor="C6EFCE", fgColor="C6EFCE")
-    ws.conditional_formatting.add(f"G4:H{last}", FormulaRule(formula=["$G4>$B$2"], fill=red, font=Font(name=F, color="9C0006")))
-    ws.conditional_formatting.add(f"G4:H{last}", FormulaRule(formula=["$G4<=$B$2"], fill=grn, font=Font(name=F, color="006100")))
-    n = last + 2
-    ws.cell(n, 1, "Notes").font = Font(name=F, bold=True)
-    for i, t in enumerate(["On, Idle and Off Time (blue) = sum of report rows that start in that clock hour.",
-                           "An hour with no activity at all (no report rows) is counted as Off Time = 1:00:00, so Missing Time is 0.",
-                           "Missing Time = 1 hour - (On + Idle + Off), never below 0."]):
-        ws.cell(n + 1 + i, 1, t).font = body
+    thin_side = Side(style="thin", color="BFBFBF")
+    border = Border(
+        left=thin_side,
+        right=thin_side,
+        top=thin_side,
+        bottom=thin_side,
+    )
+    duration_format = "[h]:mm:ss"
 
-    sm = wb.create_sheet("Summary")
-    for c, h in enumerate(["Machine Name", "On Time", "Idle Time", "Off Time", "Missing Time", "Note"], 1):
-        x = sm.cell(1, c, h); x.font = hf; x.fill = hfill; x.border = bd; x.alignment = Alignment(horizontal="center")
-    for i, m in enumerate(order, 2):
-        sm.cell(i, 1, m)
-        if m in data:
-            for c, col in ((2, "D"), (3, "E"), (4, "F"), (5, "G")):
-                sm.cell(i, c, f"=SUMIFS(Hourly!${col}$4:${col}${last},Hourly!$C$4:$C${last},$A{i})").number_format = DUR
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Hourly"
+
+    worksheet["A1"] = (
+        f"Hourly Machine Time Report - {date or 'Unknown date'} "
+        "09:00 to next day 09:00"
+    )
+    worksheet["A1"].font = Font(name=font_name, bold=True, size=13)
+
+    worksheet["A2"] = "Threshold:"
+    worksheet["A2"].font = Font(name=font_name, bold=True)
+
+    worksheet["B2"] = f"=TIME(0,{threshold},0)"
+    worksheet["B2"].number_format = duration_format
+    worksheet["B2"].font = Font(
+        name=font_name, bold=True, color="0000FF"
+    )
+
+    headers = [
+        "Time Duration",
+        "Shift",
+        "Machine Name",
+        "On Time",
+        "Idle Time",
+        "Off Time",
+        "Missing Time",
+        f"Above {threshold} Min Threshold",
+    ]
+
+    for column, heading in enumerate(headers, 1):
+        cell = worksheet.cell(3, column, heading)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center")
+
+    row_number = 4
+
+    for machine in order:
+        if machine not in data:
+            continue
+
+        _, aggregate = _aggregate_hours(data[machine])
+
+        for hour in slots:
+            on, idle, off = aggregate[hour]
+
+            worksheet.cell(
+                row_number, 1,
+                f"{hour:02d}:00 - {(hour + 1) % 24:02d}:00",
+            )
+            worksheet.cell(
+                row_number,
+                2,
+                "A (09:00-21:00)"
+                if 9 <= hour < 21
+                else "B (21:00-09:00)",
+            )
+            worksheet.cell(row_number, 3, machine)
+
+            for column, seconds in zip((4, 5, 6), (on, idle, off)):
+                cell = worksheet.cell(
+                    row_number,
+                    column,
+                    timedelta(seconds=seconds),
+                )
+                cell.font = blue_font
+                cell.number_format = duration_format
+
+            worksheet.cell(
+                row_number,
+                7,
+                f"=MAX(0,TIME(1,0,0)-(D{row_number}+"
+                f"E{row_number}+F{row_number}))",
+            )
+
+            worksheet.cell(
+                row_number,
+                8,
+                f'=IF(G{row_number}>$B$2,'
+                '"Above threshold","Within threshold")',
+            ).alignment = Alignment(horizontal="center")
+
+            for column in range(1, 9):
+                cell = worksheet.cell(row_number, column)
+                cell.border = border
+
+                if column not in (4, 5, 6):
+                    cell.font = body_font
+
+            worksheet.cell(row_number, 7).number_format = duration_format
+            row_number += 1
+
+    last_row = row_number - 1
+
+    for column, width in zip(
+        "ABCDEFGH", [16, 20, 20, 12, 12, 12, 14, 24]
+    ):
+        worksheet.column_dimensions[column].width = width
+
+    worksheet.freeze_panes = "A4"
+
+    if last_row >= 4:
+        worksheet.auto_filter.ref = f"A3:H{last_row}"
+
+        # Correct PatternFill syntax.
+        red_fill = PatternFill(
+            fill_type="solid", fgColor="FFC7CE"
+        )
+        green_fill = PatternFill(
+            fill_type="solid", fgColor="C6EFCE"
+        )
+
+        worksheet.conditional_formatting.add(
+            f"G4:H{last_row}",
+            FormulaRule(
+                formula=["$G4>$B$2"],
+                fill=red_fill,
+                font=Font(name=font_name, color="9C0006"),
+            ),
+        )
+
+        worksheet.conditional_formatting.add(
+            f"G4:H{last_row}",
+            FormulaRule(
+                formula=["$G4<=$B$2"],
+                fill=green_fill,
+                font=Font(name=font_name, color="006100"),
+            ),
+        )
+
+    notes_row = max(last_row + 2, 6)
+    worksheet.cell(notes_row, 1, "Notes").font = Font(
+        name=font_name, bold=True
+    )
+
+    notes = [
+        "On, Idle and Off Time (blue) are sums of report rows "
+        "starting in each clock hour.",
+        "An hour with no activity is counted as Off Time = 1:00:00.",
+        "Missing Time = max(0, 1 hour - On Time - Idle Time - Off Time).",
+    ]
+
+    for index, note in enumerate(notes, 1):
+        worksheet.cell(notes_row + index, 1, note).font = body_font
+
+    # Summary worksheet.
+    summary = workbook.create_sheet("Summary")
+
+    summary_headers = [
+        "Machine Name",
+        "On Time",
+        "Idle Time",
+        "Off Time",
+        "Missing Time",
+        "Note",
+    ]
+
+    for column, heading in enumerate(summary_headers, 1):
+        cell = summary.cell(1, column, heading)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center")
+
+    for index, machine in enumerate(order, 2):
+        summary.cell(index, 1, machine)
+
+        if machine in data:
+            for column, source_column in (
+                (2, "D"),
+                (3, "E"),
+                (4, "F"),
+                (5, "G"),
+            ):
+                cell = summary.cell(
+                    index,
+                    column,
+                    f"=SUMIFS(Hourly!${source_column}$4:"
+                    f"${source_column}${last_row},"
+                    f"Hourly!$C$4:$C${last_row},$A{index})",
+                )
+                cell.number_format = duration_format
         else:
-            sm.cell(i, 6, "No data in report")
-        for c in range(1, 7): sm.cell(i, c).font = body; sm.cell(i, c).border = bd
-    for c, w in zip("ABCDEF", [16, 14, 14, 14, 14, 22]): sm.column_dimensions[c].width = w
-    wb.save(out)
+            summary.cell(index, 6, "No data in report")
 
+        for column in range(1, 7):
+            summary.cell(index, column).font = body_font
+            summary.cell(index, column).border = border
+
+    for column, width in zip(
+        "ABCDEF", [20, 14, 14, 14, 16, 24]
+    ):
+        summary.column_dimensions[column].width = width
+
+    workbook.save(out)
+
+
+def parse_dashboard_text(text):
+    """Parse copied dashboard rows, including text without separators.
+
+    Whole-hour rows take precedence over smaller intervals. Shift and
+    total rows of four hours or more are ignored.
+    """
+    duration_pattern = re.compile(
+        r"(?:\d+\s*h\s*)?(?:\d+\s*m\s*)?(?:\d+\s*s)?"
+    )
+
+    text = (text or "").replace("\r", "")
+    text = text.replace("\t", "|").replace("\n", "|")
+
+    spans = list(_SPAN_RE.finditer(text))
+    hours = {}
+    subhour_rows = []
+
+    for index, match in enumerate(spans):
+        segment_end = (
+            spans[index + 1].start()
+            if index + 1 < len(spans)
+            else len(text)
+        )
+        segment = text[match.end():segment_end]
+
+        shots_match = re.search(r"(\d+)\s*shot\(s\)", segment)
+        kwh_match = re.search(r"kWh", segment, re.IGNORECASE)
+
+        if not shots_match or not kwh_match:
+            continue
+
+        position = kwh_match.end()
+        durations = []
+
+        while len(durations) < 4:
+            while position < len(segment) and segment[position] in " |":
+                position += 1
+
+            duration_match = duration_pattern.match(segment, position)
+
+            if (
+                not duration_match
+                or duration_match.end() == position
+            ):
+                break
+
+            token = duration_match.group().strip()
+
+            # Only accept tokens that contain a duration unit.
+            if not re.search(r"[hms]", token):
+                break
+
+            durations.append(dur(token))
+            position = duration_match.end()
+
+        if len(durations) < 3:
+            continue
+
+        h1, m1, h2, m2 = map(int, match.groups())
+
+        start = h1 * 60 + m1
+        end = h2 * 60 + m2
+
+        if end <= start:
+            end += 24 * 60
+
+        span = end - start
+
+        if span >= 240:
+            continue
+
+        row = {
+            "time": f"{h1:02d}:{m1:02d} - {h2:02d}:{m2:02d}",
+            "status": segment[:shots_match.start()].strip(" |,"),
+            "shots": f"{shots_match.group(1)} shot(s)",
+            "on": durations[0],
+            "idle": durations[1],
+            "off": durations[2],
+        }
+
+        if start % 60 == 0 and span == 60:
+            hours.setdefault(h1 % 24, row)
+        elif row not in subhour_rows:
+            subhour_rows.append(row)
+
+    return list(hours.values()) + [
+        row
+        for row in subhour_rows
+        if int(row["time"][:2]) % 24 not in hours
+    ]
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("folder"); ap.add_argument("-o", "--out")
-    ap.add_argument("--threshold", type=int, default=10, help="minutes")
-    ap.add_argument("--expect", nargs="*", default=[], help="machines that should appear")
-    a = ap.parse_args()
+    """Command-line entry point."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("folder")
+    parser.add_argument("-o", "--out")
+    parser.add_argument(
+        "--threshold", type=int, default=10, help="Threshold in minutes"
+    )
+    parser.add_argument(
+        "--expect", nargs="*", default=[],
+        help="Machines that should appear",
+    )
 
-    data, date = {}, None
-    for p in sorted(glob.glob(os.path.join(a.folder, "*.pdf"))):
-        mach, d, rows = parse_pdf(p)
-        if not mach: print("skip (no machine name):", p); continue
-        date = date or d
-        seen = data.setdefault(mach, [])
-        for r in rows:
-            if r not in seen: seen.append(r)   # same row in two shift PDFs counts once
-        print(f"{mach}: {len(rows)} rows from {os.path.basename(p)}")
-    if not data: sys.exit("No reports found")
-    out = a.out or f"Hourly_Machine_Time_Report_{(date or 'report').replace(' ', '')}.xlsx"
-    build_workbook(data, date, out, a.threshold, a.expect); print("Saved", out)
+    args = parser.parse_args()
+
+    data = {}
+    report_date = None
+
+    for path in sorted(glob.glob(os.path.join(args.folder, "*.pdf"))):
+        machine, date, rows = parse_pdf(path)
+
+        if not machine:
+            print("Skipped (machine name not found):", path)
+            continue
+
+        report_date = report_date or date
+        seen = data.setdefault(machine, [])
+
+        for row in rows:
+            if row not in seen:
+                seen.append(row)
+
+        print(f"{machine}: {len(rows)} rows from {os.path.basename(path)}")
+
+    if not data:
+        sys.exit("No reports found")
+
+    output_path = args.out or (
+        f"Hourly_Machine_Time_Report_"
+        f"{(report_date or 'report').replace(' ', '')}.xlsx"
+    )
+
+    build_workbook(
+        data,
+        report_date,
+        output_path,
+        args.threshold,
+        args.expect,
+    )
+
+    print("Saved", output_path)
 
 
 if __name__ == "__main__":
     main()
-
-
-def hourly_table(data, order=None):
-    """Return a list of dict rows (seconds) for every machine and clock hour."""
-    slots = [(9 + i) % 24 for i in range(24)]
-    out = []
-    for m in (order or sorted(data)):
-        if m not in data: continue
-        agg = {s: [0, 0, 0] for s in slots}
-        for row in data[m]:
-            h = int(row["time"].split(":")[0])
-            agg[h][0] += row["on"]; agg[h][1] += row["idle"]; agg[h][2] += row["off"]
-        for s in slots:
-            on, idle, off = agg[s]
-            if on + idle + off == 0: off = 3600   # no activity at all in this hour = machine off
-            out.append(dict(hour=f"{s:02d}:00 - {(s + 1) % 24:02d}:00",
-                            shift="A" if 9 <= s < 21 else "B", machine=m,
-                            on=on, idle=idle, off=off, missing=max(0, 3600 - (on + idle + off))))
-    return out
-
-
-# ---------- Pasted dashboard text ----------
-_SPAN_RE = re.compile(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})")
-_DUR_RE = re.compile(r"(?:\d+h[ ]*)?(?:\d+m[ ]*)?(?:\d+s)?")
-
-
-def parse_dashboard_text(text):
-    """Parse hourly rows copied from the dashboard's 'Hourly Details' table.
-
-    Works with tab/line-separated paste and with text that was pasted with no
-    separators at all. Returns rows in the same format as parse_pdf().
-    Whole-hour rows (09:00 - 10:00) are used when present; otherwise the
-    smaller rows inside the hour are used. Shift rows (09:00 - 21:00) are ignored.
-    """
-    t = text.replace("\r", "").replace("\t", "|").replace("\n", "|")
-    spans = list(_SPAN_RE.finditer(t))
-    hours, subs = {}, []
-    for i, m in enumerate(spans):
-        seg = t[m.end(): spans[i + 1].start() if i + 1 < len(spans) else len(t)]
-        sm = re.search(r"(\d+)\s*shot\(s\)", seg)
-        km = re.search(r"kWh", seg)
-        if not sm or not km:
-            continue
-        pos, toks = km.end(), []
-        while len(toks) < 4:
-            while pos < len(seg) and seg[pos] in " |":
-                pos += 1
-            d = _DUR_RE.match(seg, pos)
-            if not d or d.end() == pos:
-                break
-            toks.append(dur(d.group())); pos = d.end()
-        if len(toks) < 3:
-            continue
-        h1, m1, h2, m2 = (int(x) for x in m.groups())
-        start, end = h1 * 60 + m1, h2 * 60 + m2
-        if end <= start:
-            end += 1440
-        span = end - start
-        if span >= 240:          # shift / total rows
-            continue
-        row = dict(time=f"{h1:02d}:{m1:02d} - {h2:02d}:{m2:02d}",
-                   status=seg[:sm.start()].strip(" |,"), shots=f"{sm.group(1)} shot(s)",
-                   on=toks[0], idle=toks[1], off=toks[2])
-        if start % 60 == 0 and span == 60:
-            hours.setdefault(h1 % 24, row)
-        elif row not in subs:
-            subs.append(row)
-    return list(hours.values()) + [r for r in subs if int(r["time"][:2]) % 24 not in hours]
